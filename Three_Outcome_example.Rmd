@@ -1,0 +1,995 @@
+---
+title: "Untitled"
+output: html_document
+date: '2024-04-05'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(DiagrammeR)
+library(nnet)
+# for performance comparison
+library(mclust)
+library(kernlab)
+library(kohonen)
+library(class)
+library(clue) # NMI
+library(cluster)
+library(fpc) # RI
+library(tibble)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(MOTRL)
+
+library(ggpubr)
+library(ggplot2)
+library(ggtern)
+library(gridExtra)
+library(cowplot)
+library(grid)
+# load("~/Desktop/Multi-Outcome Tree/Yao file/CancerData.RData")
+# setwd("~/Desktop/Multi-Outcome Tree R")
+setwd("R")
+source("Benefit_gain.R")
+source("best.H.R")
+source("MO_Tree_Chang.R")
+source("predict_leaf.R")
+source("Reg.mu.R")
+source("Split.X.R")
+source("visualization.R")
+source("vis_tree.R")
+Custom.color <- c("#CD2626","#79aec1","#2E8B57","#d6b55a")
+# c("#cc340c","#e8490f","#f18800","#e4ce00","#9ec417","#13a983","#44c1f0","#3f60aa")
+
+```
+
+
+```{r}
+setwd("Application")
+load("CancerData.RData")
+```
+
+# update data generation 12022024
+
+```{r}
+set.seed(412)
+k <- 4          # Number of treatments
+n <- 100        # Number of patients per group
+j <- 5          # Number of covariates
+groups <- 1:8   # Total groups
+group <- rep(groups, each = n)
+
+# Covariate generation
+X <- matrix(NA, nrow = n * length(groups), ncol = j)
+X[, 1] <- rnorm(n * length(groups), 0, 0.05) + (group - 1) / 5
+X[, 2] <- rnorm(n * length(groups), mean = 0, sd = 0.05) - 0.5 * (group - 4)
+for (jj in 3:j) {
+  X[, jj] <- rnorm(n * length(groups), mean = 0, sd = 0.05)
+}
+
+# Define outcome means for each group
+m1 <- c(4, 1, 0.5, 0, 3, 0, 1.5, 0, 4, 0, 0.5, 1)   # Treatment 1 dominates for Group 1 and 2
+m2 <- c(4, 0, 0, 1.5, 3, 0.5, 0, 0.5, 4, 1, 0, 0.5)   # Same dominance structure as Group 1
+m3 <- c(3, 1.5, 0.5, 0, 4, 0, 0, 1, 4, 1, 2, 0.5)    # Treatments 1 and 2 dominate
+m4 <- c(4, 3, 2, 1, 1, 4, 1, 4, 2.5, 3, 0, 1)   # Treatments 2 and 3 dominate
+m5 <- c(1, 0.5, 0, 4, 2, 0, 1, 4, 0.5, 0, 1, 4)   # Treatment 4 dominates for Group 5 and 6
+m6 <- c(1.5, 1, 0.5, 4, 1, 1.5, 0, 4, 2, 1, 0, 4)   # Same dominance structure as Group 5
+m7 <- c(0, 0, 4, 2.5, 0, 1, 3, 2, 0, 0, 4, 1)   # Treatments 3 and 4 dominate
+m8 <- c(0, 4, 0, 2, 0, 1, 0, 2, 0.5, 2.5, 3, 4)   # Treatments 2 and 4 dominate
+list_m <- list(m1, m2, m3, m4, m5, m6, m7, m8)
+
+# Generate outcomes for all groups
+Y <- matrix(0, n * length(groups), 3 * k)
+for (ii in 1:(n * length(groups))) {
+  ind <- group[ii]
+  Y[ii, ] <- list_m[[ind]] +
+    X[ii, 1] * 0.2 +
+    X[ii, 2] * -0.1 +
+    X[ii, 3] * -0.0005 +
+    X[ii, 4] * 0.0001 +
+    X[ii, 5] * -0.0001 +
+    rnorm(12, 0, 0.3)
+}
+
+# Split outcomes into Y1, Y2, Y3 for each treatment
+Y1 <- Y[, c(1, 4, 7, 10)]
+Y2 <- Y[, c(2, 5, 8, 11)]
+Y3 <- Y[, c(3, 6, 9, 12)]
+
+# Generate observed outcomes based on random true treatment
+true_treatment <- sample(1:k, n * length(groups), replace = TRUE)
+Y1.obs <- sapply(1:(n * length(groups)), function(i) Y1[i, true_treatment[i]])
+Y2.obs <- sapply(1:(n * length(groups)), function(i) Y2[i, true_treatment[i]])
+Y3.obs <- sapply(1:(n * length(groups)), function(i) Y3[i, true_treatment[i]])
+
+# Assign true groups based on Pareto dominance
+df_obs <- data.frame(
+  Y1_obs = Y1.obs,
+  Y2_obs = Y2.obs,
+  Y3_obs = Y3.obs,
+  Treat_num = true_treatment,
+  Group = factor(group)
+)
+
+# Map groups to true groups (6 true groups)
+df_obs$true_Group <- case_when(
+  df_obs$Group %in% c(1, 2) ~ 1,
+  df_obs$Group %in% c(3) ~ 2,
+  df_obs$Group %in% c(4) ~ 3,
+  df_obs$Group %in% c(5, 6) ~ 4,
+  df_obs$Group %in% c(7) ~ 5,
+  df_obs$Group %in% c(8) ~ 6
+)
+
+# Assign treatments as factors
+df_obs$Treatment <- as.factor(case_when(
+  df_obs$Treat_num == 1 ~ "A",
+  df_obs$Treat_num == 2 ~ "B",
+  df_obs$Treat_num == 3 ~ "C",
+  df_obs$Treat_num == 4 ~ "D"
+))
+
+# Add covariates to the data frame
+for (cov in 1:j) {
+  df_obs[[paste0("X", cov)]] <- X[, cov]
+}
+
+# Plot the observed outcomes for illustration
+p1 <- ggplot(data = df_obs, aes(x = Y1_obs, y = Y2_obs, color = Treatment)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~Group, nrow = 2) +
+    coord_fixed(ratio = 1) +
+  labs(
+    title = "Observed Outcomes for Y1 and Y2",
+    x = "Observed Outcome 1",
+    y = "Observed Outcome 2"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(data = df_obs, aes(x = Y2_obs, y = Y3_obs, color = Treatment)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~Group, nrow = 2) +  
+  coord_fixed(ratio = 1) +
+  labs(
+    title = "Observed Outcomes for Y2 and Y3",
+    x = "Observed Outcome 2",
+    y = "Observed Outcome 3"
+  ) +
+  theme_minimal() 
+
+
+p3 <- ggplot(data = df_obs, aes(x = Y1_obs, y = Y3_obs, color = Treatment)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~Group, nrow = 2) +
+    coord_fixed(ratio = 1) +
+  labs(
+    title = "Observed Outcomes for Y1 and Y3",
+    x = "Observed Outcome 1",
+    y = "Observed Outcome 3"
+  ) +
+  theme_minimal()
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+## Data generation
+n_Grp groups
+n_A treatment
+n_Y outcomes
+j number of covariates
+
+```{r}
+set.seed(412)
+n_A = 4
+n_Y = 3
+n_Grp = 4
+n = 100
+j = 5
+
+
+group = rep(1:n_A,each = n)
+x = rnorm(n*n_Grp,0,0.05) + (group-1)
+x = round(x,3)
+plot(density(x))
+
+
+### YS update covaraite generation
+X = matrix(NA, nrow = n * n_Grp, ncol = j)
+X[, 1] = rnorm(n*n_Grp,0,0.05) + (group-1)/3
+X[, 2] = rnorm(n * n_Grp, mean = 0, sd = 0.05) - 0.5 * (group - 2) 
+for (k in 3:j) {
+  X[, k] = rnorm(n * n_Grp, mean = 0, sd = 0.05)
+}
+
+Parameter = matrix(rnorm(n_Grp * n_A * n_Y, 0 ,1),
+                   n_Grp,n_A * n_Y) # 4 groups, 4*n individuals
+
+Y = matrix(0,n*n_Grp,n_A * n_Y)
+for(ii in 1:(n*n_Grp)){
+  ind = group[ii]
+  Y[ii,] = Parameter[ind,] + 
+                X[ii, 1] * 0.1 +  
+                X[ii, 2] * 0.05 +  
+                X[ii, 3] * -0.0005 + 
+                X[ii, 4] * 0.0001 +  
+                X[ii, 5] * -0.0001 + 
+                # rnorm(8, 0, 0.3)  
+    rnorm( n_A * n_Y, 0, 0.2)
+}
+
+Y_record = list()
+for(ii in 1:n_Y){
+  Y_record[[ii]] = Y[,(ii-1)*n_A + (1:n_A)]
+}
+Y1 = Y_record[[1]]
+Y2 = Y_record[[2]]
+Y3 = Y_record[[3]]
+
+
+# YS update data generation
+# Generating the obserevd data
+true_treatment = sample(1:n_A, n * n_Grp, replace = TRUE)
+Y1.obs3 = sapply(1:(n * n_Grp), function(i) Y1[i, true_treatment[i]])
+Y2.obs3 = sapply(1:(n * n_Grp), function(i) Y2[i, true_treatment[i]])
+Y3.obs3 = sapply(1:(n * n_Grp), function(i) Y3[i, true_treatment[i]])
+
+df_obs3 = data.frame(
+  Y1_obs = Y1.obs3,
+  Y2_obs = Y2.obs3,
+  Y3_obs = Y3.obs3,
+  Treat_num = true_treatment,
+  Group = factor(group)
+)
+df_obs3$Treatment = as.factor(case_when(df_obs3$Treat_num == 1 ~ "A",
+                                        df_obs3$Treat_num == 2 ~ "B",
+                                        df_obs3$Treat_num == 3 ~ "C",
+                                        df_obs3$Treat_num == 4 ~ "D"))
+for (cov in 1:j) {
+  df_obs3[[paste0("X", cov)]] = X[, cov]
+}
+
+
+
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+Y1Y2 = ggplot(data = df_obs3,aes(x = Y1_obs,
+                                 y = Y2_obs,
+                                 col = Treatment))+
+  geom_point()+
+  facet_wrap(~Group)+
+  ylab("Outcome 2")+
+  xlab("Outcome 1")+ 
+  scale_colour_manual(values = cols)
+Y1Y2
+Y1Y3 = ggplot(data = df_obs3,aes(x = Y1_obs,
+                                 y = Y3_obs,
+                                 col = Treatment))+
+  geom_point()+
+  facet_wrap(~Group)+
+  ylab("Outcome 3")+
+  xlab("Outcome 1")+ 
+  scale_colour_manual(values = cols)
+Y1Y3
+Y2Y3 = ggplot(data = df_obs3,aes(x = Y2_obs,
+                                 y = Y3_obs,
+                                 col = Treatment))+
+  geom_point()+
+  facet_wrap(~Group)+
+  ylab("Outcome 3")+
+  xlab("Outcome 2")+ 
+  scale_colour_manual(values = cols)
+Y2Y3
+```
+## Tree growth
+
+```{r}
+tmp = vector()
+for(ii in seq(0,1,0.1)){
+  for(jj in seq(0,1-ii,0.1) ){
+    tmp = rbind(tmp,c(ii,jj,1-ii-jj))
+  }
+}
+w_vec = tmp
+
+# from YS code
+Cov = df_obs3 %>% dplyr::select(starts_with("X"))
+treeout = DTRtree(Ys = cbind(df_obs3$Y1_obs, df_obs3$Y2_obs, df_obs3$Y3_obs),
+                  A = df_obs3$Treat_num,
+                  H = Cov,
+                  pis.hat=NULL,
+                  mus.reg=NULL,
+                  depth=2,
+                  minsplit=20,
+                  w_vec = w_vec,
+                  weight_combine = "mean",
+                  lambda = 0.02)
+
+treeout
+newdata = Cov
+leaf_pred = predict_leaf.DTR(treeout, Cov)
+table(leaf_pred)
+leaf_n = table(leaf_pred)
+
+tree0 = vis_tree(max_h = 3,treeout,number = table(leaf_pred))
+plot(tree0)
+
+pred_label = unique(leaf_pred)
+# chosen1 = which(leaf_pred == pred_label[1])
+```
+
+### Point Visualization
+```{R}
+class.A = sort(unique(df_obs3$Treatment))
+label0 = paste(c("A","B","C","D"),":",class.A, sep="")
+
+
+p_list2 = list()
+p_list3 = list()
+leaf_vec = sort(unique(leaf_pred))
+n_leaf = length(leaf_vec)
+
+for(ii in 1:n_leaf){
+  chosen = which(leaf_pred == leaf_vec[ii])
+  (p_list2[[ii]] = my_vis_elipse(Y1,Y2,chosen,
+                                 k=4,ref_k = 1, label=label0,lwd=3, textsize = 10))
+}
+
+
+# + xlim(-0.3,0.25) + ylim(-0.2,0.3)
+
+plot4 = function(p_list){
+  # 2. Save the legend
+  legend <- get_legend(p_list[[4]])
+  
+  # 3. Remove the legend from the box plot
+  for(ii in 1:n_leaf){
+    p_list[[ii]] <- p_list[[ii]] + theme(legend.position="none") + 
+      ggtitle(paste("Leaf Node",ii,", N=",leaf_n[ii]))
+  }
+  p1 <- p_list[[1]] + theme(legend.position="none") 
+  p2 <- p_list[[2]] + theme(legend.position="none") 
+  p3 <- p_list[[3]] + theme(legend.position="none")
+  p4 <- p_list[[4]] + theme(legend.position="none")
+  
+  # 4. Create a blank plot
+  blankPlot <- ggplot()+geom_blank(aes(1,1)) + 
+    cowplot::theme_nothing()
+  # pdf(file = "~/Desktop/Multi_Outcome/cluster/LZ_compare/LZ_assumption.pdf",
+  #     width = 17.4 / 2.54*1.5, # The width of the plot in inches
+  #     height = 17.4 / 2.54 * 0.75) # The height of the plot in inches
+  p = grid.arrange(p1,p3,
+                   legend,p2,p4, legend, ncol=3,
+                   widths=c(5, 5, 2),
+                   top=textGrob("Different Leaf Node's Shape",
+                                gp=gpar(fontsize=18,fontface="bold")))
+  p
+}
+
+# triangle
+p = plot4(p_list = p_list2)
+```
+
+
+```{R}
+
+# It's recommended to use a named vector
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+#+ scale_colour_manual(values = cols)
+
+
+
+pred_label = unique(leaf_pred)
+# chosen1 = which(leaf_pred == pred_label[4])
+
+opt.trt.vis = function(chosen1){
+  data = as.data.frame(w_vec)
+  colnames(data) = c("x","y","z")
+  data$A.opt = 0
+  for(ii in 1:nrow(data)){
+    U = data[ii,1] * colMeans(Y_record[[1]][chosen1,]) + 
+        data[ii,2] * colMeans(Y_record[[2]][chosen1,]) + 
+        data[ii,3] * colMeans(Y_record[[3]][chosen1,])  
+    data$Treat[ii] = which.max(U)
+  }
+  vec0 = c("A","B","C","D")
+  data$Treat = vec0[data$Treat]
+  data$Treat = as.factor(data$Treat)
+  
+  library(plyr)
+  df.tot = data
+  df.mu = data.frame(x = 0.2,y=0.3,z=0.5)
+  p1 = ggtern(data=df.tot,aes(x,y,z)) + 
+    geom_point(aes(color=Treat),alpha=1,size = 10) + 
+    geom_crosshair_tern(data=df.mu) +
+    geom_point(data=df.mu,color='red') + 
+    geom_label(data=100*df.mu,
+               aes(y = y - 10,
+                   label=sprintf("Y1=%.1f, Y2=%.1f, Y3=%.1f",0.2,0.3,0.5)
+               ),
+               size=3,
+               color='red'
+    ) + 
+    scale_colour_manual(values = cols) + 
+    theme_bw() +
+    theme_showarrows() + 
+    limit_tern(1,1,1) +
+    labs(
+      x = 'Y1',xarrow='Y1',
+      y = 'Y2',yarrow='Y2',
+      z = 'Y3',zarrow='Y3'
+    )
+  p1
+}
+
+
+chosen1 = which(leaf_pred == pred_label[1])
+p1 = opt.trt.vis(chosen1) 
+
+chosen1 = which(leaf_pred == pred_label[2])
+p2 = opt.trt.vis(chosen1)
+
+chosen1 = which(leaf_pred == pred_label[3])
+p3 = opt.trt.vis(chosen1)
+
+chosen1 = which(leaf_pred == pred_label[4])
+p4 = opt.trt.vis(chosen1)
+
+
+p = plot4(p_list = list(p1,p2,p3,p4))
+#plot_grid(p)
+
+```
+
+
+# YS update from Chang
+
+```{r}
+tmp = vector()
+for(ii in seq(0,1,0.1)){
+  for(jj in seq(0,1-ii,0.1) ){
+    tmp = rbind(tmp,c(ii,jj,1-ii-jj))
+  }
+}
+w_vec = tmp
+
+A = sample(c("A","B","C","D"),n_Grp*n,replace = TRUE,prob=c(1/4,1/4,1/4,1/4)) 
+class.A = sort(unique(A))
+H = matrix(x,ncol=1)
+# n = length(A)
+
+k<-K<-length(class.A)
+m<-N<-length(A)
+
+# label0 = paste(c("A","B","C","D"),":",class.A,sep="")
+
+
+# treeout = DTRtree(mus.hat = Y_record,
+#         A,H,pis.hat=NULL,
+#                   mus.reg=NULL,depth=3,
+#                   minsplit=20,w_vec = w_vec,weight_combine = "mean",lambda = 0.02)
+treeout = DTRtree(Ys = cbind(as.vector(Y1), as.vector(Y2), as.vector(Y3)),
+                  A,H,pis.hat=NULL,
+                  mus.reg=NULL,depth=3,
+                  minsplit=20,w_vec = w_vec,weight_combine = "mean",lambda = 0.02)
+
+
+treeout
+newdata = H
+(leaf_pred = predict_leaf.DTR(treeout, H))
+table(leaf_pred)
+leaf_n = table(leaf_pred)
+
+tree0 = vis_tree(max_h = 3,treeout,number = table(leaf_pred))
+plot(tree0)
+
+
+pred_label = unique(leaf_pred)
+chosen1 = which(leaf_pred == pred_label[1])
+```
+
+
+## Archived
+
+```{r}
+set.seed(12345)
+n_A = 4
+n_Y = 3
+n_Grp = 4
+n = 100
+
+
+group = rep(1:n_A,each = n)
+x = rnorm(n*n_Grp,0,0.05) + (group-1)
+x = round(x,3)
+plot(density(x))
+
+
+# (A1,Y1) (A1,Y2) (A1,Y3) (A2,Y1) ... 
+Parameter = matrix(rnorm(n_Grp * n_A * n_Y, 0 ,1),
+                   n_Grp,n_A * n_Y) # 4 groups, 4*n individuals
+
+Y = matrix(0,n*n_Grp,n_A * n_Y)
+for(ii in 1:(n*n_Grp)){
+  ind = group[ii]
+  Y[ii,] = Parameter[ind,] + 
+    rnorm( n_A * n_Y, 0, 0.2)
+}
+
+Y_record = list()
+for(ii in 1:n_Y){
+  Y_record[[ii]] = Y[,(ii-1)*n_A + (1:n_A)]
+}
+
+#Y1 = n * n_grp (by) n_A treatments 
+
+df_vis = data.frame(y1 = as.vector(Y_record[[1]]),
+                    y2 = as.vector(Y_record[[2]]),
+                    y3 = as.vector(Y_record[[3]]),
+                    Treat = rep(c("A","B","C","D"),each = nrow(Y_record[[1]])),
+                    group = rep(group,n_A))
+df_vis$Treat = as.factor(df_vis$Treat)
+
+
+# YS update data generation
+# Generating the obserevd data
+# true_treatment = sample(1:n_A, n * n_Grp, replace = TRUE)
+# Y1.obs3 = sapply(1:(n * n_Grp), function(i) Y1[i, true_treatment[i]])
+# Y2.obs3 = sapply(1:(n * n_Grp), function(i) Y2[i, true_treatment[i]])
+# Y3.obs3 = sapply(1:(n * n_Grp), function(i) Y3[i, true_treatment[i]])
+# 
+# df_obs3 = data.frame(
+#   Y1_obs = Y1.obs3,
+#   Y2_obs = Y2.obs3,
+#   Y3_obs = Y3.obs3,
+#   Treat_num = true_treatment,
+#   Group = factor(group)
+# )
+# df_obs3$Treatment = as.factor(case_when(df_obs3$Treat_num == 1 ~ "A",
+#                                         df_obs3$Treat_num == 2 ~ "B",
+#                                         df_obs3$Treat_num == 3 ~ "C",
+#                                         df_obs3$Treat_num == 4 ~ "D"))
+for (cov in 1:j) {
+  df_obs3[[paste0("X", cov)]] = X[, cov]
+}
+
+
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+
+ggplot(data = df_vis,aes(x = y1,y = y2,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 2")+xlab("Outcome 1")+ scale_colour_manual(values = cols)
+
+ggplot(data = df_vis,aes(x = y1,y = y3,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 3")+xlab("Outcome 1")+ scale_colour_manual(values = cols)
+
+ggplot(data = df_vis,aes(x = y2,y = y3,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 3")+xlab("Outcome 2")+ scale_colour_manual(values = cols)
+```
+
+
+```{r}
+tmp = vector()
+for(ii in seq(0,1,0.1)){
+  for(jj in seq(0,1-ii,0.1) ){
+    tmp = rbind(tmp,c(ii,jj,1-ii-jj))
+  }
+}
+
+w_vec = tmp
+A = c()
+A = sample(c("A","B","C","D"),n_Grp*n,replace = TRUE,prob=c(1/4,1/4,1/4,1/4)) 
+class.A = sort(unique(A))
+H = matrix(x,ncol=1)
+n = length(A)
+
+
+k<-K<-length(class.A)
+m<-N<-length(A)
+
+label0 = paste(c("A","B","C","D"),":",class.A,sep="")
+
+
+treeout = DTRtree(mus.hat = Y_record,
+                  A,H,pis.hat=NULL,
+                  mus.reg=NULL,depth=3,
+                  minsplit=20,w_vec = w_vec,weight_combine = "mean",lambda = 0.02)
+
+
+treeout
+newdata = H
+(leaf_pred = predict_leaf.DTR(treeout, H))
+table(leaf_pred)
+leaf_n = table(leaf_pred)
+
+tree0 = vis_tree(max_h = 3,treeout,number = table(leaf_pred))
+plot(tree0)
+
+
+pred_label = unique(leaf_pred)
+chosen1 = which(leaf_pred == pred_label[1])
+```
+
+
+
+### Point Visualization
+```{R}
+p_list2 = list()
+p_list3 = list()
+leaf_vec = sort(unique(leaf_pred))
+n_leaf = length(leaf_vec)
+
+
+for(ii in 1:n_leaf){
+  chosen = which(leaf_pred==leaf_vec[ii])
+  (p_list2[[ii]] = my_vis_elipse(Y_record[[1]],Y_record[[2]],chosen,
+                                 k=4,ref_k = 1, label=label0,lwd=3))
+}
+
+
+
+# + xlim(-0.3,0.25) + ylim(-0.2,0.3)
+
+plot4 = function(p_list){
+  # 2. Save the legend
+  legend <- get_legend(p_list[[4]])
+  
+  # 3. Remove the legend from the box plot
+  for(ii in 1:n_leaf){
+    p_list[[ii]] <- p_list[[ii]] + theme(legend.position="none") + 
+      ggtitle(paste("Leaf Node",ii,", N=",leaf_n[ii]))
+  }
+  p1 <- p_list[[1]] + theme(legend.position="none") 
+  p2 <- p_list[[2]] + theme(legend.position="none") 
+  p3 <- p_list[[3]] + theme(legend.position="none")
+  p4 <- p_list[[4]] + theme(legend.position="none")
+  
+  # 4. Create a blank plot
+  blankPlot <- ggplot()+geom_blank(aes(1,1)) + 
+    cowplot::theme_nothing()
+  # pdf(file = "~/Desktop/Multi_Outcome/cluster/LZ_compare/LZ_assumption.pdf",
+  #     width = 17.4 / 2.54*1.5, # The width of the plot in inches
+  #     height = 17.4 / 2.54 * 0.75) # The height of the plot in inches
+  p = grid.arrange(p1,p3,
+                   legend,p2,p4, legend, ncol=3,
+                   widths=c(5, 5, 2),
+                   top=textGrob("Different Leaf Node's Shape",
+                                gp=gpar(fontsize=18,fontface="bold")))
+  p
+}
+
+# triangle
+p = plot4(p_list = p_list2)
+#plot_grid(p)
+
+
+
+```
+
+
+```{R}
+library("ggtern")
+library(ggplot2)
+
+# It's recommended to use a named vector
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+#+ scale_colour_manual(values = cols)
+
+c("#cc340c","#e8490f","#f18800","#e4ce00",
+  "#9ec417","#13a983","#44c1f0","#3f60aa")
+
+
+pred_label = unique(leaf_pred)
+chosen1 = which(leaf_pred == pred_label[4])
+
+opt.trt.vis = function(chosen1){
+  data = as.data.frame(w_vec)
+  colnames(data) = c("x","y","z")
+  data$A.opt = 0
+  for(ii in 1:nrow(data)){
+    U = data[ii,1] * colMeans(Y_record[[1]][chosen1,]) + 
+      data[ii,2] * colMeans(Y_record[[2]][chosen1,]) + 
+      data[ii,3] * colMeans(Y_record[[3]][chosen1,])  
+    data$Treat[ii] = which.max(U)
+  }
+  vec0 = c("A","B","C","D")
+  data$Treat = vec0[data$Treat]
+  data$Treat = as.factor(data$Treat)
+  
+  library(plyr)
+  df.tot = data
+  df.mu = data.frame(x = 0.2,y=0.3,z=0.5)
+  p1 = ggtern(data=df.tot,aes(x,y,z)) + 
+    geom_point(aes(color=Treat),alpha=1,size = 10) + 
+    geom_crosshair_tern(data=df.mu) +
+    geom_point(data=df.mu,color='red') + 
+    geom_label(data=100*df.mu,
+               aes(y = y - 10,
+                   label=sprintf("Y1=%.1f, Y2=%.1f, Y3=%.1f",0.2,0.3,0.5)
+               ),
+               size=3,
+               color='red'
+    ) + scale_colour_manual(values = cols) + 
+    theme_bw() +
+    theme_showarrows() + 
+    limit_tern(1,1,1) +
+    labs(
+      x = 'Y1',xarrow='Y1',
+      y = 'Y2',yarrow='Y2',
+      z = 'Y3',zarrow='Y3'
+    )
+  p1
+}
+
+
+chosen1 = which(leaf_pred == pred_label[1])
+p1 = opt.trt.vis(chosen1) 
+chosen1 = which(leaf_pred == pred_label[2])
+p2 = opt.trt.vis(chosen1)
+chosen1 = which(leaf_pred == pred_label[3])
+p3 = opt.trt.vis(chosen1)
+chosen1 = which(leaf_pred == pred_label[4])
+p4 = opt.trt.vis(chosen1)
+
+
+p = plot4(p_list = list(p1,p2,p3,p4))
+#plot_grid(p)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Archived
+```{r}
+set.seed(12345)
+n_A = 4
+n_Y = 3
+n_Grp = 4
+
+n = 100
+
+group = rep(1:n_A,each = n)
+x = rnorm(n*n_Grp,0,0.05) + (group-1)
+x = round(x,3)
+plot(density(x))
+
+
+# n_Grp groups
+# n_A treatment
+# n_Y outcomes
+
+
+# (A1,Y1) (A1,Y2) (A1,Y3) (A2,Y1) ... 
+Parameter = matrix(rnorm(n_Grp * n_A * n_Y, 0 ,1),
+                   n_Grp,n_A * n_Y)
+
+
+Y = matrix(0,n*n_Grp,n_A * n_Y)
+
+for(ii in 1:(n*n_Grp)){
+  ind = group[ii]
+  Y[ii,] = Parameter[ind,] + rnorm( n_A * n_Y,0,0.2)
+}
+
+Y_record = list()
+for(ii in 1:n_Y){
+  Y_record[[ii]] = Y[,(ii-1)*n_A + (1:n_A)]
+}
+
+
+
+#Y1 = n * n_grp (by) n_A treatments 
+
+df_vis = data.frame(y1 = as.vector(Y_record[[1]]),
+                    y2 = as.vector(Y_record[[2]]),
+                    y3 = as.vector(Y_record[[3]]),
+                    Treat = rep(c("A","B","C","D"),each = nrow(Y_record[[1]])),
+                    group = rep(group,n_A))
+df_vis$Treat = as.factor(df_vis$Treat)
+
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+#
+
+ggplot(data = df_vis,aes(x = y1,y = y2,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 2")+xlab("Outcome 1")+ scale_colour_manual(values = cols)
+
+ggplot(data = df_vis,aes(x = y1,y = y3,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 3")+xlab("Outcome 1")+ scale_colour_manual(values = cols)
+
+ggplot(data = df_vis,aes(x = y2,y = y3,col = Treat))+geom_point()+facet_wrap(~group)+ylab("Outcome 3")+xlab("Outcome 2")+ scale_colour_manual(values = cols)
+```
+
+```{r}
+tmp = vector()
+for(ii in seq(0,1,0.1)){
+  for(jj in seq(0,1-ii,0.1) ){
+    tmp = rbind(tmp,c(ii,jj,1-ii-jj))
+  }
+}
+
+w_vec = tmp
+
+A = sample(c("A","B","C","D"),n_Grp*n,replace = TRUE,prob=c(1/4,1/4,1/4,1/4)) 
+class.A = sort(unique(A))
+H = matrix(x,ncol=1)
+n = length(A)
+
+
+k<-K<-length(class.A)
+m<-N<-length(A)
+
+label0 = paste(c("A","B","C","D"),":",class.A,sep="")
+
+
+treeout = DTRtree(mus.hat = Y_record,
+                  A,H,pis.hat=NULL,
+                  mus.reg=NULL,depth=3,
+                  minsplit=20,w_vec = w_vec,weight_combine = "mean",lambda = 0.02)
+
+
+
+
+treeout
+newdata = H
+(leaf_pred = predict_leaf.DTR(treeout, H))
+table(leaf_pred)
+leaf_n = table(leaf_pred)
+
+tree0 = vis_tree(max_h = 3,treeout,number = table(leaf_pred))
+plot(tree0)
+
+
+pred_label = unique(leaf_pred)
+chosen1 = which(leaf_pred == pred_label[1])
+```
+
+
+
+
+### Point Visualization
+```{R}
+
+
+
+p_list2 = list()
+p_list3 = list()
+leaf_vec = sort(unique(leaf_pred))
+n_leaf = length(leaf_vec)
+
+
+for(ii in 1:n_leaf){
+  chosen = which(leaf_pred==leaf_vec[ii])
+  (p_list2[[ii]] = my_vis_elipse(Y_record[[1]],Y_record[[2]],chosen,
+                                 k=4,ref_k = 1, label=label0,lwd=3))
+}
+
+
+
+# + xlim(-0.3,0.25) + ylim(-0.2,0.3)
+
+plot4 = function(p_list){
+  # 2. Save the legend
+  legend <- get_legend(p_list[[4]])
+  
+  # 3. Remove the legend from the box plot
+  for(ii in 1:n_leaf){
+    p_list[[ii]] <- p_list[[ii]] + theme(legend.position="none") + 
+      ggtitle(paste("Leaf Node",ii,", N=",leaf_n[ii]))
+  }
+  p1 <- p_list[[1]] + theme(legend.position="none") 
+  p2 <- p_list[[2]] + theme(legend.position="none") 
+  p3 <- p_list[[3]] + theme(legend.position="none")
+  p4 <- p_list[[4]] + theme(legend.position="none")
+  
+  # 4. Create a blank plot
+  blankPlot <- ggplot()+geom_blank(aes(1,1)) + 
+    cowplot::theme_nothing()
+  # pdf(file = "~/Desktop/Multi_Outcome/cluster/LZ_compare/LZ_assumption.pdf",
+  #     width = 17.4 / 2.54*1.5, # The width of the plot in inches
+  #     height = 17.4 / 2.54 * 0.75) # The height of the plot in inches
+  p = grid.arrange(p1,p3,
+                   legend,p2,p4, legend, ncol=3,
+                   widths=c(5, 5, 2),
+                   top=textGrob("Different Leaf Node's Shape",
+                                gp=gpar(fontsize=18,fontface="bold")))
+  p
+}
+
+# triangle
+p = plot4(p_list = p_list2)
+#plot_grid(p)
+
+
+
+```
+
+
+```{R}
+library("ggtern")
+library(ggplot2)
+
+# It's recommended to use a named vector
+cols <- c("A" = "#E63946", "C" = "#44c1f0", "B" = "#9ec417", "D" = "#e4ce00")
+#+ scale_colour_manual(values = cols)
+
+c("#cc340c","#e8490f","#f18800","#e4ce00",
+  "#9ec417","#13a983","#44c1f0","#3f60aa")
+
+
+pred_label = unique(leaf_pred)
+chosen1 = which(leaf_pred == pred_label[4])
+
+opt.trt.vis = function(chosen1){
+  data = as.data.frame(w_vec)
+  colnames(data) = c("x","y","z")
+  data$A.opt = 0
+  for(ii in 1:nrow(data)){
+    U = data[ii,1] * colMeans(Y_record[[1]][chosen1,]) + 
+      data[ii,2] * colMeans(Y_record[[2]][chosen1,]) + 
+      data[ii,3] * colMeans(Y_record[[3]][chosen1,])  
+    data$Treat[ii] = which.max(U)
+  }
+  vec0 = c("A","B","C","D")
+  data$Treat = vec0[data$Treat]
+  data$Treat = as.factor(data$Treat)
+  
+  library(plyr)
+  df.tot = data
+  df.mu = data.frame(x = 0.2,y=0.3,z=0.5)
+  p1 = ggtern(data=df.tot,aes(x,y,z)) + 
+    geom_point(aes(color=Treat),alpha=1,size = 10) + 
+    geom_crosshair_tern(data=df.mu) +
+    geom_point(data=df.mu,color='red') + 
+    geom_label(data=100*df.mu,
+               aes(y = y - 10,
+                   label=sprintf("Y1=%.1f, Y2=%.1f, Y3=%.1f",0.2,0.3,0.5)
+               ),
+               size=3,
+               color='red'
+    ) + scale_colour_manual(values = cols) + 
+    theme_bw() +
+    theme_showarrows() + 
+    limit_tern(1,1,1) +
+    labs(
+      x = 'Y1',xarrow='Y1',
+      y = 'Y2',yarrow='Y2',
+      z = 'Y3',zarrow='Y3'
+    )
+  p1
+}
+
+
+chosen1 = which(leaf_pred == pred_label[1])
+p1 = opt.trt.vis(chosen1) 
+chosen1 = which(leaf_pred == pred_label[2])
+p2 = opt.trt.vis(chosen1)
+chosen1 = which(leaf_pred == pred_label[3])
+p3 = opt.trt.vis(chosen1)
+chosen1 = which(leaf_pred == pred_label[4])
+p4 = opt.trt.vis(chosen1)
+
+
+p = plot4(p_list = list(p1,p2,p3,p4))
+#plot_grid(p)
+
+```
+
+
+
+
+
+
+
+
+
+

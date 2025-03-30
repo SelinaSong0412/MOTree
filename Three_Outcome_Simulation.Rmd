@@ -1,0 +1,695 @@
+---
+title: "Three-Outcome Simulation Code"
+output: html_document
+date: '2024-04-04'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggpubr)
+library(ggplot2)
+library(gridExtra)
+library(cowplot)
+library(grid)
+library(DiagrammeR)
+library(nnet)
+# for performance comparison
+library(mclust)
+library(kernlab)
+library(kohonen)
+library(class)
+library(mclust)
+library(clue) # NMI
+library(cluster)
+library(fpc) # RI
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(MOTRL)
+
+setwd("R")
+source("Benefit_gain.R")
+source("best.H.R")
+source("MO_Tree_Chang.R")
+source("predict_leaf.R")
+source("Reg.mu.R")
+source("Split.X.R")
+source("visualization.R")
+source("vis_tree.R")
+
+source("mus.AIPW.R")
+source("M.propen.R")
+Custom.color = c("#CD2626","#79aec1","#2E8B57","#d6b55a")
+
+map_to_consecutive = function(x) {
+  mapped_values = match(x, unique(x))
+  return(mapped_values)
+}
+```
+
+
+## YS update simulation function with new designed pareto dominances
+
+```{r}
+Simulation_MOTree_3 = function(iter = 100, n.cov = 5, n.per.group = 100) {
+  
+  nmi_results = rep(list(rep(NA, iter)),7) 
+  ari_results = rep(list(rep(NA, iter)),7) 
+  weights <- expand.grid(seq(0, 1, by = 0.2), seq(0, 1, by = 0.2)) %>%
+    filter(Var1 + Var2 <= 1) %>%
+    mutate(Var3 = round((1 - Var1 - Var2), 1))
+  
+  for (w_idx in 1:nrow(weights)) {
+    assign(paste0("avg_cf_results", w_idx), rep(list(rep(NA, iter)),7) )
+    assign(paste0("true_optimal_weighted_mean", w_idx), numeric(iter))  
+    assign(paste0("non_dominant_results", w_idx), rep(list(rep(NA, iter)), 7))  
+    
+  }
+  
+  for (i in c(1:iter)) {
+    
+    ###########################################
+    ############ Data generation ##############
+    ###########################################
+    set.seed(412 + i)
+    k = 4 # number of treatment
+    n_grp = 8  # Number of groups
+    total_patients <- n.per.group * n_grp
+        
+    # group = rep(1:4, each = n.per.group)
+    groups <- 1:n_grp   # Total groups
+    group <- rep(groups, each = n.per.group)
+
+    
+    X <- matrix(NA, nrow = n.per.group * n_grp, ncol = j)
+    X[, 1] <- rnorm(n.per.group * n_grp, 0, 0.05) + (group - 1) / 5
+    X[, 2] <- rnorm(n.per.group * n_grp, mean = 0, sd = 0.05) - 0.5 * (group - 4)
+    for (jj in 3:j) {
+      X[, jj] <- rnorm(n.per.group * n_grp, mean = 0, sd = 0.05)
+    }
+    
+    # m1 <- c(4, 1, 0.5, 0, 3, 0, 0.5, 0, 4, 0, 0.5, 1)   # Treatment 1 dominates for Group 1 and 2
+    # m2 <- c(4, 0, 0, 1.5, 3, 0.5, 0, 0.5, 4, 1, 0, 0.5)   # Same dominance structure as Group 1
+    # m3 <- c(4, 3, 2, 1, 3, 2, 1, 0, 4, 3, 1, 1)   # Treatments 1 and 2 dominate
+    # m4 <- c(3, 3, 3, 2, 4, 4, 4, 2, 3, 3, 2, 1)   # Treatments 2 and 3 dominate
+    # m5 <- c(1, 0.5, 0, 4, 0, 0, 1, 4, 0.5, 0, 1, 4)   # Treatment 4 dominates for Group 5 and 6
+    # m6 <- c(1.5, 1, 1.5, 4, 1, 1.5, 0, 4, 0, 1, 0, 4)   # Same dominance structure as Group 5
+    # m7 <- c(0, 0, 4, 4, 1, 1, 4, 4, 0, 0, 4, 5)   # Treatments 3 and 4 dominate
+    # m8 <- c(0, 4, 0, 4, 1, 5, 1, 4, 0, 4, 0, 4)   # Treatments 2 and 4 dominate
+    m1 <- c(4, 1, 0.5, 0, 3, 0, 1.5, 0, 4, 0, 0.5, 1)   # Treatment 1 dominates for Group 1 and 2
+    m2 <- c(4, 0, 0, 1.5, 3, 0.5, 0, 0.5, 4, 1, 0, 0.5)   # Same dominance structure as Group 1
+    m3 <- c(3, 1.5, 0.5, 0, 4, 0, 0, 1, 4, 1, 2, 0.5)    # Treatments 1 and 2 dominate
+    m4 <- c(4, 3, 2, 1, 1, 4, 1, 4, 2.5, 3, 0, 1)   # Treatments 2 and 3 dominate
+    m5 <- c(1, 0.5, 0, 4, 2, 0, 1, 4, 0.5, 0, 1, 4)   # Treatment 4 dominates for Group 5 and 6
+    m6 <- c(1.5, 1, 0.5, 4, 1, 1.5, 0, 4, 2, 1, 0, 4)   # Same dominance structure as Group 5
+    m7 <- c(0, 0, 4, 2.5, 0, 1, 3, 2, 0, 0, 4, 1)   # Treatments 3 and 4 dominate
+    m8 <- c(0, 4, 0, 2, 0, 1, 0, 2, 0.5, 2.5, 3, 4)   # Treatments 2 and 4 dominate
+    list_m <- list(m1, m2, m3, m4, m5, m6, m7, m8)
+    
+    Y <- matrix(0, n.per.group * n_grp, 3 * k)
+    for (ii in 1:(n.per.group * n_grp)) {
+      ind <- group[ii]
+      Y[ii, ] <- list_m[[ind]] +
+        X[ii, 1] * 0.1 +
+        X[ii, 2] * 0.05 +
+        X[ii, 3] * -0.0005 +
+        X[ii, 4] * 0.0001 +
+        X[ii, 5] * -0.0001 +
+        rnorm(12, 0, 0.3)
+    }
+    Y1 <- Y[, c(1, 4, 7, 10)]
+    Y2 <- Y[, c(2, 5, 8, 11)]
+    Y3 <- Y[, c(3, 6, 9, 12)]
+    
+    true_treatment <- sample(1:k, n.per.group * n_grp, replace = TRUE)
+    Y1.obs <- sapply(1:(n.per.group * n_grp), function(i) Y1[i, true_treatment[i]])
+    Y2.obs <- sapply(1:(n.per.group * n_grp), function(i) Y2[i, true_treatment[i]])
+    Y3.obs <- sapply(1:(n.per.group * n_grp), function(i) Y3[i, true_treatment[i]])
+    
+    df_obs <- data.frame(
+      Y1_obs = Y1.obs,
+      Y2_obs = Y2.obs,
+      Y3_obs = Y3.obs,
+      Treat_num = true_treatment,
+      Group = factor(group)
+    )
+    df_obs$true_Group <- case_when(
+      df_obs$Group %in% c(1, 2, 3) ~ 1,
+      df_obs$Group %in% c(4) ~ 2,
+      df_obs$Group %in% c(5, 6) ~ 3,
+      df_obs$Group %in% c(7) ~ 4,
+      df_obs$Group %in% c(8) ~ 5
+    )
+    df_obs$Treatment <- as.factor(case_when(
+      df_obs$Treat_num == 1 ~ "A",
+      df_obs$Treat_num == 2 ~ "B",
+      df_obs$Treat_num == 3 ~ "C",
+      df_obs$Treat_num == 4 ~ "D"
+    ))
+    for (cov in 1:j) {
+      df_obs[[paste0("X", cov)]] <- X[, cov]
+    }
+    # X <- matrix(NA, nrow = n.per.group * n_grp, ncol = n.cov)
+    # X[, 1] <- rnorm(n.per.group * n_grp, 0, 0.05) + (group - 1) / 3
+    # X[, 2] <- rnorm(n.per.group * n_grp, mean = 0, sd = 0.05) - 0.5 * (group - 2)
+    # for (k in 3:n.cov) {
+    #   X[, k] <- rnorm(n.per.group * n_grp, mean = 0, sd = 0.05)
+    # }
+    # 
+    # n_Y <- 3  # Number of outcomes (Y1, Y2, Y3)
+    # Parameter <- matrix(rnorm(n_grp * k * n_Y, 0, 1), nrow = n_grp, ncol = k * n_Y)
+    # Y <- matrix(0, nrow = n.per.group * n_grp, ncol = k * n_Y)
+    # for (ii in 1:(n.per.group * n_grp)) {
+    #   ind <- group[ii]
+    #   Y[ii, ] <- Parameter[ind, ] + 
+    #     rnorm(k * n_Y, 0, 0.2)
+    # }
+    # Y_record <- lapply(1:n_Y, function(yy) Y[, ((yy - 1) * k + 1):(yy * k)])
+    # Y1 <- Y_record[[1]]
+    # Y2 <- Y_record[[2]]
+    # Y3 <- Y_record[[3]]
+    # 
+    # 
+    # true_treatment <- sample(1:k, n.per.group * n_grp, replace = TRUE)
+    # Y1.obs <- sapply(1:(n.per.group * n_grp), function(i) Y1[i, true_treatment[i]])
+    # Y2.obs <- sapply(1:(n.per.group * n_grp), function(i) Y2[i, true_treatment[i]])
+    # Y3.obs <- sapply(1:(n.per.group * n_grp), function(i) Y3[i, true_treatment[i]])
+    # 
+    # df_obs <- data.frame(
+    #   Y1_obs = Y1.obs,
+    #   Y2_obs = Y2.obs,
+    #   Y3_obs = Y3.obs,
+    #   Treat_num = true_treatment,
+    #   Group = factor(group)
+    # )
+    # 
+    # # df_obs$Treatment <- factor(
+    # #   df_obs$Treat_num,
+    # #   labels = c("A", "B", "C", "D")
+    # # )
+    # df_obs$Treatment = as.factor(case_when(df_obs$Treat_num == 1 ~ "A",
+    #                                        df_obs$Treat_num == 2 ~ "B",
+    #                                        df_obs$Treat_num == 3 ~ "C",
+    #                                        df_obs$Treat_num == 4 ~ "D"))
+    # 
+    # for (cov in 1:n.cov) {
+    #   df_obs[[paste0("X", cov)]] <- X[, cov]
+    # }
+    
+    ####### Pareto Dominance Evaluation #######
+    non_dominant_treatments <- lapply(1:total_patients, function(patient) {
+      outcomes <- cbind(Y1[patient, ], Y2[patient, ], Y3[patient, ])  
+      is_non_dominated <- function(outcomes) {
+        apply(outcomes, 1, function(x) {
+          !any(apply(outcomes, 1, function(y) all(y >= x) & any(y > x)))
+        })
+      }
+      pareto_front <- which(is_non_dominated(outcomes))
+      return(pareto_front)  
+    })
+    
+    ## true optimal weighted conterfactual mean
+    for (w_idx in 1:nrow(weights)) {
+      w <- as.numeric(weights[w_idx, ])
+      
+      # Weighted counterfactual outcomes for all treatments
+      Y_w <- w[1] * Y1 + w[2] * Y2 + w[3] * Y3
+      # Maximum weighted counterfactual outcome for each individual (Y*_opt)
+      max_weighted_outcomes <- apply(Y_w, 1, max)
+      assign(paste0("true_optimal_weighted_mean", w_idx),
+             replace(get(paste0("true_optimal_weighted_mean", w_idx)), i, mean(max_weighted_outcomes)))
+    }
+    
+    
+    
+    ###########################################
+    ########## Clustering methods #############
+    ###########################################
+    
+    ## MOTree
+    Cov = df_obs %>% dplyr::select(starts_with("X"))
+    treeout = DTRtree(Ys = cbind(df_obs$Y1_obs, df_obs$Y2_obs, df_obs$Y3_obs),
+                      A = df_obs$Treat_num,
+                      H = Cov,
+                      pis.hat=NULL,
+                      mus.reg=NULL,
+                      depth=2,
+                      minsplit=20,
+                      w_vec = as.matrix(weights),
+                      weight_combine = "mean",
+                      lambda = 0.05)
+    leaf_pred = predict_leaf.DTR(treeout, newdata = Cov)
+    df_obs$group.MOTree = map_to_consecutive(leaf_pred)
+    
+    SimuData = df_obs %>% dplyr::select(# Y1_obs, Y2_obs, 
+      # Treat_num, 
+      starts_with("X"))
+    
+    ## K-means 
+    kmeans_result3 = kmeans(SimuData, centers = 3)  # Assuming 3 clusters
+    kmeans_result4 = kmeans(SimuData, centers = 4)  # Assuming 3 clusters
+    df_obs$group.kmeans3 = kmeans_result3$cluster
+    df_obs$group.kmeans4 = kmeans_result4$cluster
+    
+    ## Hierarchical
+    hc_result = hclust(dist(SimuData), method = "ward.D") # "ward.D2")
+    hc_clusters = cutree(hc_result, k = 3) # k = 4)
+    df_obs$group.hc = hc_clusters
+    
+    ## GMM
+    gmm_result = Mclust(SimuData) 
+    df_obs$group.gmm = gmm_result$classification 
+    
+    ## Spectral Clustering
+    spectral_result = specc(as.matrix(SimuData), centers = 4)  # Assuming 4 clusters
+    df_obs$group.spectral = spectral_result@.Data
+    
+    ## Self-Organizing Map (SOM)
+    som_grid = kohonen::somgrid(xdim = 2, ydim = 2, topo = "rectangular")
+    som_model = kohonen::som(as.matrix(SimuData), grid = som_grid, rlen = 100)
+    som_clusters = cutree(hclust(dist(som_model$codes[[1]])), k = 4)  
+    som_result = som_model$unit.classif
+    df_obs$group.som = som_clusters[som_result]
+    
+    ###########################################
+    ############ Begin comparison #############
+    ###########################################
+    true_labels_nmi = as.cl_partition(df_obs$true_Group)     
+    true_labels_ari = as.numeric(df_obs$true_Group)      
+    clustering_methods = list(
+      MOTree = df_obs$group.MOTree,
+      # MOTRL = NA,
+      HC = df_obs$group.hc,
+      GMM = df_obs$group.gmm,
+      KMeans3 = df_obs$group.kmeans3,
+      KMeans4 = df_obs$group.kmeans4,
+      Spectral = df_obs$group.spectral,
+      SOM = df_obs$group.som
+    )
+    
+    dist_matrix = dist(as.matrix(SimuData))
+    
+    for (method in seq_along(clustering_methods)) {
+      method_name = names(clustering_methods)[method]
+      pred_labels_nmi = as.cl_partition(clustering_methods[[method_name]])  
+      pred_labels_ari = as.numeric(clustering_methods[[method_name]])    
+      cluster_labels = as.numeric(clustering_methods[[method_name]])      
+      nmi_results[[method]][i] = as.numeric(cl_agreement(true_labels_nmi, 
+                                                         pred_labels_nmi, 
+                                                         method = "NMI"))
+      ari_results[[method]][i] = cluster.stats(dist_matrix, true_labels_ari, 
+                                               pred_labels_ari)$corrected.rand
+      
+      cluster_opt_trt = list()
+      for (w_idx in 1:nrow(weights)) {
+        w <- as.numeric(weights[w_idx, ])
+        Y_w <- w[1] * Y1 + w[2] * Y2 + w[3] * Y3
+        
+        # find cluster-based optimal treatment for each individual (by each of the methods)
+        cluster_opt_trt[[method]] = sapply(unique(cluster_labels), 
+                                           function(cluster) {
+                                             cluster_ids = which(cluster_labels == cluster)
+                                             avg_outcomes = colMeans(Y_w[cluster_ids, , drop = FALSE])
+                                             which.max(avg_outcomes)  
+                                           })
+        
+        df_obs[[paste0("opt_trt_", method_name, "_w", w_idx)]] = sapply(cluster_labels,
+                                                                        function(cluster) cluster_opt_trt[[method]][cluster]) 
+        df_obs[[paste0("cf_", method_name, "_w", w_idx)]] = sapply(1:nrow(Y_w), 
+                                                                   function(x) Y_w[x, df_obs[[paste0("opt_trt_", method_name, "_w", w_idx)]][x]])
+        
+        avg_cf_results <- get(paste0("avg_cf_results", w_idx))
+        avg_cf_results[[method]][i] <- mean(df_obs[[paste0("cf_", method_name, "_w", w_idx)]], na.rm = T)
+        assign(paste0("avg_cf_results", w_idx), avg_cf_results)
+        
+        
+        
+        ## YS ADD THIS NEW FOR NEW MATRIC 11/25/2024
+        ## Predicted optimal treatment for current weight
+        pred_opt_trt <- df_obs[[paste0("opt_trt_", method_name, "_w", w_idx)]]
+        is_non_dominant <- sapply(seq_len(n.per.group * 4), function(patient) {
+          pred_opt_trt[patient] %in% non_dominant_treatments[[patient]]
+        })
+        non_dominant_results <- get(paste0("non_dominant_results", w_idx))
+        non_dominant_results[[method]][i] <- mean(is_non_dominant, na.rm = T)
+        assign(paste0("non_dominant_results", w_idx), non_dominant_results)
+        
+        cluster_opt_trt = list() 
+        
+      }
+      
+    }
+    
+    
+    
+  }
+  
+  # evaluation
+  nmi_mean = round(as.numeric(lapply(nmi_results, mean)),3)
+  nmi_sd = round(as.numeric(lapply(nmi_results, sd)),3)
+  ari_mean = round(as.numeric(lapply(ari_results, mean)),3)
+  ari_sd = round(as.numeric(lapply(ari_results, sd)),3)
+  nmi_out = paste0(nmi_mean, "(", nmi_sd, ")")
+  ari_out = paste0(ari_mean, "(", ari_sd, ")")
+  
+  # non_dominant_summary <- matrix(NA, nrow = length(clustering_methods), ncol = nrow(weights))
+  # rownames(non_dominant_summary) <- names(clustering_methods)
+  #   # paste0("Method_", 1:7)  # Adjust according to actual method names
+  # colnames(non_dominant_summary) <- paste0("Weight_", 1:nrow(weights))
+  
+  
+  
+  
+  # weight specific results
+  for (w_idx in 1:nrow(weights)) {
+    
+    avg_cf_results <- get(paste0("avg_cf_results", w_idx))
+    assign(paste0("avg_cf_mean", w_idx), 
+           round(as.numeric(lapply(avg_cf_results, mean)), 3))
+    assign(paste0("avg_cf_sd", w_idx), 
+           round(as.numeric(lapply(avg_cf_results, sd)), 3))
+    assign(paste0("avg_cf_out", w_idx), 
+           paste0(get(paste0("avg_cf_mean", w_idx)), 
+                  "(", get(paste0("avg_cf_sd", w_idx)), ")"))
+    
+    non_dominant_means <- get(paste0("non_dominant_results", w_idx)) # [[method]]
+    # non_dominant_summary[method, w_idx] <- mean(non_dominant_means)
+    assign(paste0("non_dominant_mean", w_idx), 
+           round(as.numeric(lapply(non_dominant_means, mean)), 3))
+    assign(paste0("non_dominant_sd", w_idx), 
+           round(as.numeric(lapply(non_dominant_means, sd)), 3))
+    assign(paste0("non_dominant_out", w_idx), 
+           paste0(get(paste0("non_dominant_mean", w_idx)), 
+                  "(", get(paste0("non_dominant_sd", w_idx)), ")"))
+  }
+  
+  
+  true_optimal_weighted_means <- sapply(1:nrow(weights), function(w_idx) {
+    mean(get(paste0("true_optimal_weighted_mean", w_idx)))
+  })
+  true_optimal_weighted_means <- t(data.frame(true_optimal_weighted_means))
+  rownames(true_optimal_weighted_means) <- "True_Optimal_Mean"
+  colnames(true_optimal_weighted_means) <- paste0("Weight_", 1:nrow(weights))# seq(0, 1, by = 0.1))
+  
+  
+  clust_perform = data.frame(NMI = nmi_out,
+                             ARI = ari_out)
+  row.names(clust_perform) = names(clustering_methods)
+  
+  cf_Y_perform = data.frame(
+    avg_cf_w1 = avg_cf_out1,
+    avg_cf_w2 = avg_cf_out2,
+    avg_cf_w3 = avg_cf_out3,
+    avg_cf_w4 = avg_cf_out4,
+    avg_cf_w5 = avg_cf_out5,
+    avg_cf_w6 = avg_cf_out6,
+    avg_cf_w7 = avg_cf_out7,
+    avg_cf_w8 = avg_cf_out8,
+    avg_cf_w9 = avg_cf_out9,
+    avg_cf_w10 = avg_cf_out10,
+    avg_cf_w11 = avg_cf_out11,
+    avg_cf_w12 = avg_cf_out12,
+    avg_cf_w13 = avg_cf_out13,
+    avg_cf_w14 = avg_cf_out14,
+    avg_cf_w15 = avg_cf_out15,
+    avg_cf_w16 = avg_cf_out16,
+    avg_cf_w17 = avg_cf_out17,
+    avg_cf_w18 = avg_cf_out18,
+    avg_cf_w19 = avg_cf_out19,
+    avg_cf_w20 = avg_cf_out20, 
+    avg_cf_w21 = avg_cf_out21)
+  row.names(cf_Y_perform) = names(clustering_methods)
+  
+  
+  
+  non_dominant_perform = data.frame(
+    non_dominant_w1 = non_dominant_out1,
+    non_dominant_w2 = non_dominant_out2,
+    non_dominant_w3 = non_dominant_out3,
+    non_dominant_w4 = non_dominant_out4,
+    non_dominant_w5 = non_dominant_out5,
+    non_dominant_w6 = non_dominant_out6,
+    non_dominant_w7 = non_dominant_out7,
+    non_dominant_w8 = non_dominant_out8,
+    non_dominant_w9 = non_dominant_out9,
+    non_dominant_w10 = non_dominant_out10,
+    non_dominant_w11 = non_dominant_out11,
+    non_dominant_w12 = non_dominant_out12,
+    non_dominant_w13 = non_dominant_out13,
+    non_dominant_w14 = non_dominant_out14,
+    non_dominant_w15 = non_dominant_out15,
+    non_dominant_w16 = non_dominant_out16,
+    non_dominant_w17 = non_dominant_out17,
+    non_dominant_w18 = non_dominant_out18,
+    non_dominant_w19 = non_dominant_out19,
+    non_dominant_w20 = non_dominant_out20,
+    non_dominant_w21 = non_dominant_out21)
+  row.names(non_dominant_perform) = names(clustering_methods)
+  
+  cf_Y_names = c(paste0("avg_cf_mean", 1:nrow(weights)), 
+                 paste0("avg_cf_sd", 1:nrow(weights)))
+  cf_Y = as.data.frame(mget(cf_Y_names))
+  row.names(cf_Y) = names(clustering_methods)
+  
+  non_dominant_names = c(paste0("non_dominant_mean", 1:nrow(weights)), 
+                         paste0("non_dominant_sd", 1:nrow(weights)))
+  non_dominant = as.data.frame(mget(non_dominant_names))
+  row.names(non_dominant) = names(clustering_methods)
+  
+  
+  return(list(clust_perform = clust_perform,
+              # cf_Y_perform = cf_Y_perform,
+              # non_dominant_perform = non_dominant_perform,
+              cf_Y = cf_Y,
+              true_optimal_weighted_means = true_optimal_weighted_means,
+              non_dominant = non_dominant
+  ))
+}
+
+
+# smaller sample size
+three_outcome_result50 = Simulation_MOTree_3(iter = 100, n.cov = 5, n.per.group = 50)
+three_outcome_result50
+
+# larger sample size
+three_outcome_result100 = Simulation_MOTree_3(iter = 5, n.cov = 5, n.per.group = 100)
+three_outcome_result100
+
+# larger sample size
+three_outcome_result200 = Simulation_MOTree_3(iter = 5, n.cov = 5, n.per.group = 200)
+three_outcome_result200
+```
+
+## performance Evaluation
+
+### Clustering Performance
+
+```{r}
+three_outcome_result50$clust_perform
+three_outcome_result50$cf_Y_perform
+three_outcome_result50$non_dominant_perform
+```
+
+```{r}
+three_outcome_result100$clust_perform
+three_outcome_result100$cf_Y_perform
+three_outcome_result100$non_dominant_perform
+```
+
+```{r}
+three_outcome_result200$clust_perform
+three_outcome_result200$cf_Y_perform
+three_outcome_result200$non_dominant_perform
+```
+
+### Visualization
+
+Sample size = 4 * 50
+
+$$Y_w^{*opt} - \hat Y_w^*$$
+```{r}
+# Extract outcomes from the simulation results
+outcomes <- result50$cf_Y  # Counterfactual outcomes
+true_opt_means <- result50$true_optimal_weighted_means  # 1x11 matrix of observed weighted outcomes
+
+# Prepare the observed means for merging
+true_opt_long <- as.data.frame(t(true_opt_means)) %>%
+  rownames_to_column(var = "Weight") %>%
+  rename(TrueOpt = True_Optimal_Mean) %>%
+  mutate(Weight = as.numeric(gsub("Weight_", "", Weight)))
+
+# Prepare the counterfactual mean outcomes and merge with observed means
+outcomes_long <- outcomes %>%
+  rownames_to_column(var = "Method") %>%
+  pivot_longer(cols = starts_with("avg_cf_mean"), 
+               names_to = "Weight", 
+               values_to = "Mean") %>%
+  mutate(Weight = as.numeric(gsub("avg_cf_mean", "", Weight)) * 0.1) %>%
+  left_join(true_opt_long, by = "Weight") %>%
+  mutate(Difference = Mean - TrueOpt)  # Calculate the difference between counterfactual and observed means
+
+# Plot the differences
+ggplot(outcomes_long, aes(x = Weight, y = Difference, color = Method, fill = Method)) +
+  geom_smooth(method = "loess", se = TRUE, size = 1.2) +  # Smoothed line with CI for difference
+  labs(title = "Difference between Estimated and True Optimal Conterfactual Outcome",
+       x = "Weight on Y1",
+       y = "Difference (Y_opt - Y_hat)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+```
+
+
+
+```{r}
+# Extract the non-dominant data from the simulation results
+non_dominant <- result50$non_dominant
+
+# Prepare the non-dominant data for plotting
+non_dominant_long <- non_dominant %>%
+  rownames_to_column(var = "Method") %>%
+  pivot_longer(cols = starts_with("non_dominant_mean"), 
+               names_to = "Weight", 
+               values_to = "Mean") %>%
+  mutate(Weight = as.numeric(gsub("non_dominant_mean", "", Weight)) * 0.1) %>%
+  left_join(
+    non_dominant %>%
+      rownames_to_column(var = "Method") %>%
+      pivot_longer(cols = starts_with("non_dominant_sd"), 
+                   names_to = "Weight", 
+                   values_to = "SD") %>%
+      mutate(Weight = as.numeric(gsub("non_dominant_sd", "", Weight)) * 0.1),
+    by = c("Method", "Weight")
+  )
+
+# Plot the percentage of non-dominance
+ggplot(non_dominant_long, aes(x = Weight, y = Mean, color = Method, fill = Method)) +
+  geom_line(size = 1.2) +  # Line for the mean percentage of non-dominance
+  geom_ribbon(aes(ymin = Mean - 1.96*SD/sqrt(200), ymax = Mean + 1.96*SD/sqrt(200)), alpha = 0.2, linetype = 0) +  # Add shadow for SD
+  labs(title = "Percentage of Non-Dominance of the Estimated Optimal Treatment",
+       x = "Weight on Y1",
+       y = "Percentage of Non-Dominance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+```
+
+
+
+
+Sample size = 4 * 500
+
+$$Y_w^{*opt} - \hat Y_w^*$$
+```{r}
+# Extract outcomes from the simulation results
+outcomes <- result500$cf_Y  # Counterfactual outcomes
+true_opt_means <- result500$true_optimal_weighted_means  # 1x11 matrix of observed weighted outcomes
+
+# Prepare the observed means for merging
+true_opt_long <- as.data.frame(t(true_opt_means)) %>%
+  rownames_to_column(var = "Weight") %>%
+  rename(TrueOpt = True_Optimal_Mean) %>%
+  mutate(Weight = as.numeric(gsub("Weight_", "", Weight)))
+
+# Prepare the counterfactual mean outcomes and merge with observed means
+outcomes_long <- outcomes %>%
+  rownames_to_column(var = "Method") %>%
+  pivot_longer(cols = starts_with("avg_cf_mean"), 
+               names_to = "Weight", 
+               values_to = "Mean") %>%
+  mutate(Weight = as.numeric(gsub("avg_cf_mean", "", Weight)) * 0.1) %>%
+  left_join(true_opt_long, by = "Weight") %>%
+  mutate(Difference = Mean - TrueOpt)  # Calculate the difference between counterfactual and observed means
+
+# Plot the differences
+ggplot(outcomes_long, aes(x = Weight, y = Difference, color = Method, fill = Method)) +
+  geom_smooth(method = "loess", se = TRUE, size = 1.2) +  # Smoothed line with CI for difference
+  labs(title = "Difference between Estimated and True Optimal Conterfactual Outcome",
+       x = "Weight on Y1",
+       y = "Difference (Y_opt - Y_hat)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+```
+
+
+
+```{r}
+# Extract the non-dominant data from the simulation results
+non_dominant <- result500$non_dominant
+
+# Prepare the non-dominant data for plotting
+non_dominant_long <- non_dominant %>%
+  rownames_to_column(var = "Method") %>%
+  pivot_longer(cols = starts_with("non_dominant_mean"), 
+               names_to = "Weight", 
+               values_to = "Mean") %>%
+  mutate(Weight = as.numeric(gsub("non_dominant_mean", "", Weight)) * 0.1) %>%
+  left_join(
+    non_dominant %>%
+      rownames_to_column(var = "Method") %>%
+      pivot_longer(cols = starts_with("non_dominant_sd"), 
+                   names_to = "Weight", 
+                   values_to = "SD") %>%
+      mutate(Weight = as.numeric(gsub("non_dominant_sd", "", Weight)) * 0.1),
+    by = c("Method", "Weight")
+  )
+
+# Plot the percentage of non-dominance
+ggplot(non_dominant_long, aes(x = Weight, y = Mean, color = Method, fill = Method)) +
+  geom_line(size = 1.2) +  # Line for the mean percentage of non-dominance
+  geom_ribbon(aes(ymin = Mean - 1.96*SD/sqrt(200), ymax = Mean + 1.96*SD/sqrt(200)), alpha = 0.2, linetype = 0) +  # Add shadow for SD
+  labs(title = "Percentage of Non-Dominance of the Estimated Optimal Treatment",
+       x = "Weight on Y1",
+       y = "Percentage of Non-Dominance") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+```
+
+
+
+
+
+
+
+# 12/02/2024 YS to do:
+
+Three outcome scenario
+
+- [Table for clustering results] 
+
+- [Figure for counterfactrual outcome and dominance]
+
+
+**Add more scenarios**
+
+- [add to Table 1 as new chunks] design other scenarios with different sample size? noise? covaraite structure
+Sample sizes: 50, 100, 200
+Current noise: Normal(0, 0.3)
+Current covaraites: 5
+
+
+

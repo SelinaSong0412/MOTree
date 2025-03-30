@@ -1,0 +1,785 @@
+---
+title: "multiple tree clustering toy example"
+output: html_document
+date: '2024-04-04'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggpubr)
+library(ggplot2)
+library(gridExtra)
+library(cowplot)
+library(grid)
+library(DiagrammeR)
+library(nnet)
+# for performance comparison
+library(mclust)
+library(kernlab)
+library(kohonen)
+library(class)
+library(mclust)
+library(clue) # NMI
+library(cluster)
+library(fpc) # RI
+
+setwd("R")
+source("Benefit_gain.R")
+source("best.H.R")
+source("MO_Tree_Chang.R")
+source("predict_leaf.R")
+source("Reg.mu.R")
+source("Split.X.R")
+source("visualization.R")
+source("vis_tree.R")
+
+source("mus.AIPW.R")
+source("M.propen.R")
+Custom.color = c("#CD2626","#79aec1","#2E8B57","#d6b55a")
+```
+
+
+
+
+
+## YS update 10/28/2024
+
+Randomly assign true treatments and simulate the observed outcomes 
+```{r}
+set.seed(412)
+k = 4
+n = 100
+j = 5  # Number of covariates
+group = rep(1:4, each = n)
+
+# We think that group 1 and 2 are the same patients regarding 
+
+
+########## Generating covariates
+### chang's single X
+# X1 = rnorm(n*4,0,0.05) + (group-1)/3
+# plot(density(X1, from = -0.2, to = 1.2), main = "Density of X1")
+
+### YS first temp
+# X = matrix(rnorm(n * 4 * j, 0, 0.05), nrow = n * 4, ncol = j)
+
+### YS second temp
+X = matrix(NA, nrow = n * 4, ncol = j)
+X[, 1] = rnorm(n*4,0,0.05) + (group-1)/3
+X[, 2] = rnorm(n * 4, mean = 0, sd = 0.05) - 0.5 * (group - 2) 
+for (k in 3:j) {
+  X[, k] = rnorm(n * 4, mean = 0, sd = 0.05)
+}
+
+
+plot(density(X[,1], from = -0.2, to = 1.2), main = "Density of X1")
+plot(density(X[,2], from = -0.2, to = 1.2), main = "Density of X2")
+
+
+m1 = c(1, 0, 0, 1, -1, 0, 0, -1)
+m2 = c(1, 0, 0, 1, 0, -1, -1, 0)
+m3 = c(0, -1, 1, 0, 0, 1, -1, 0)
+m4 = c(-1, 0, 0, -1, 1, 0, 0, 1)
+list_m = list(m1 = m1, m2 = m2, m3 = m3, m4 = m4)
+Y = matrix(0, n * 4, 2 * 4)
+for (ii in 1:(4 * n)) {
+  ind = group[ii]
+  Y[ii, ] = list_m[[ind]] + 
+            X[ii, 1] * 0.1 +  
+            X[ii, 2] * 0.05 +  
+            X[ii, 3] * -0.0005 + 
+            X[ii, 4] * 0.0001 +  
+            X[ii, 5] * -0.0001 + 
+            rnorm(8, 0, 0.3)  
+}
+Y1 = Y[, c(1, 3, 5, 7)]
+Y2 = Y[, c(2, 4, 6, 8)]
+
+# Generating the obserevd data
+true_treatment = sample(1:4, n * 4, replace = TRUE)
+Y1.obs = sapply(1:(n * 4), function(i) Y1[i, true_treatment[i]])
+Y2.obs = sapply(1:(n * 4), function(i) Y2[i, true_treatment[i]])
+
+df_obs = data.frame(
+  Y1_obs = Y1.obs,
+  Y2_obs = Y2.obs,
+  Treat_num = true_treatment,
+  Group = factor(group)
+)
+df_obs$Treatment = as.factor(case_when(df_obs$Treat_num == 1 ~ "A",
+                                       df_obs$Treat_num == 2 ~ "B",
+                                       df_obs$Treat_num == 3 ~ "C",
+                                       df_obs$Treat_num == 4 ~ "D"))
+for (cov in 1:j) {
+  df_obs[[paste0("X", cov)]] = X[, cov]
+}
+
+ggplot(data = df_obs, aes(x = Y1_obs, y = Y2_obs, color = Treatment)) +
+  geom_point() +
+  facet_wrap(~Group) +
+  ylab("Observed Outcome 2") +
+  xlab("Observed Outcome 1")
+
+head(df_obs)
+```
+
+
+YS update for 8 treatment scenario
+```{r}
+set.seed(412)
+k = 8
+n = 100
+j = 5  # Number of covariates
+group = rep(1:8, each = n.per.group)
+X = matrix(NA, nrow = n.per.group * 8, ncol = n.cov)
+X[, 1] = rnorm(n.per.group* 8,0,0.05) + (group-1)/3
+X[, 2] = rnorm(n.per.group * 8, mean = 0, sd = 0.05) - 0.5 * (group - 2) 
+for (k in 3:n.cov) {
+  X[, k] = rnorm(n.per.group * 8, mean = 0, sd = 0.05)
+}
+m1 = c(3, 2, 4, 2, 2, 1, 1, 2, 
+       3.5, 3.5, 2, 4, 1, 3.5, 2, 3)
+m2 = c(2, 4, 3.5, 3.5, 4, 2, 1, 3.5, 
+       1, 2, 2, 3, 2, 1, 3, 2)
+m3 = c(2, 4, 3.5, 3.5, 4, 2, 2, 1, 
+       1, 2, 2, 3, 3, 2, 1, 3.5)
+m3 = c(2, 4, 3.5, 3.5, 4, 2, 2, 1, 
+       1, 2, 2, 3, 3, 2, 1, 3.5) # YS to update 8 trt scenario
+
+m4 = c(-1, 0, 0, -1, 1, 0, 0, 1)
+m5 = c(1, 0, 0, 1, -1, 0, 0, -1)
+m6 = c(1, 0, 0, 1, 0, -1, -1, 0)
+m7 = c(0, -1, 1, 0, 0, 1, -1, 0)
+m8 = c(-1, 0, 0, -1, 1, 0, 0, 1)
+list_m = list(m1 = m1, m2 = m2, m3 = m3, m4 = m4, 
+              m5 = m5, m6 = m6, m7 = m7, m8 = m8)
+Y = matrix(0, n.per.group * 8, 2 * 8)
+for (ii in 1:(8 * n.per.group)) {
+  ind = group[ii]
+  Y[ii, ] = list_m[[ind]] + 
+    X[ii, 1] * 0.1 +  
+    X[ii, 2] * 0.05 +  
+    X[ii, 3] * -0.0005 + 
+    X[ii, 4] * 0.0001 +  
+    X[ii, 5] * -0.0001 + 
+    rnorm(8, 0, 0.3)  
+}
+Y1 = Y[, c(1, 3, 5, 7, 9, 11, 13, 15)]
+Y2 = Y[, c(2, 4, 6, 8, 10, 12, 14, 16)]
+
+true_treatment = sample(1:4, n.per.group * 8, replace = TRUE)
+Y1.obs = sapply(1:(n.per.group * 8), function(i) Y1[i, true_treatment[i]])
+Y2.obs = sapply(1:(n.per.group * 8), function(i) Y2[i, true_treatment[i]])
+
+df_obs = data.frame(
+  Y1_obs = Y1.obs,
+  Y2_obs = Y2.obs,
+  Treat_num = true_treatment,
+  Group = factor(group)
+)
+df_obs$Treatment = as.factor(case_when(df_obs$Treat_num == 1 ~ "A",
+                                       df_obs$Treat_num == 2 ~ "B",
+                                       df_obs$Treat_num == 3 ~ "C",
+                                       df_obs$Treat_num == 4 ~ "D"))
+for (cov in 1:j) {
+  df_obs[[paste0("X", cov)]] = X[, cov]
+}
+
+ggplot(data = df_obs, aes(x = Y1_obs, y = Y2_obs, color = Treatment)) +
+  geom_point() +
+  facet_wrap(~Group) +
+  ylab("Observed Outcome 2") +
+  xlab("Observed Outcome 1")
+
+head(df_obs)
+```
+
+
+
+
+
+
+
+generate conditional mean Y
+fit working model E(Y|X,A)
+estimate pseudo outcome Yhat under 4 As => input
+working_model = list() / NULL
+
+```{r}
+w0 = seq(0,1,0.02) 
+Cov = df_obs %>% dplyr::select(starts_with("X"))
+treeout = DTRtree(Ys = cbind(df_obs$Y1_obs, df_obs$Y2_obs), 
+        A = df_obs$Treat_num,
+        H = Cov,
+        pis.hat=NULL,
+        mus.reg=NULL,
+        depth=2,
+        minsplit=20,
+        w_vec = cbind(w0,1-w0),
+        weight_combine = "mean",
+        lambda = 0.05)
+
+treeout
+leaf_pred = predict_leaf.DTR(treeout, newdata = Cov)
+# table(leaf_pred)
+# leaf_n = table(leaf_pred)
+tree0 = vis_tree(max_h = 2,treeout,number = table(leaf_pred))
+plot(tree0)
+
+
+map_to_consecutive = function(x) {
+  mapped_values = match(x, unique(x))
+  return(mapped_values)
+}
+df_obs$group.MOTree = map_to_consecutive(leaf_pred)
+```
+### Point Visualization
+
+```{r, warning=FALSE}
+class.A = sort(unique(A))
+k=K=length(class.A)
+# label0 = paste(c("A","B","C","D"),":",class.A,sep="")
+label0 = class.A
+
+p_list2 = list()
+p_list3 = list()
+leaf_vec = sort(unique(leaf_pred))
+n_leaf = length(leaf_vec)
+
+for(ii in 1:n_leaf){
+  chosen = which(leaf_pred==leaf_vec[ii])
+  (p_list2[[ii]] = my_vis_elipse(mu1.hat,
+                                 mu2.hat,
+                                 chosen,
+                                 k=4,ref_k = 1, label=label0,lwd=3,
+                                 textsize = 10))
+}
+
+
+# + xlim(-0.3,0.25) + ylim(-0.2,0.3)
+
+plot4 = function(p_list){
+  # 2. Save the legend
+  legend = get_legend(p_list[[1]])
+  
+  # 3. Remove the legend from the box plot
+  for(ii in 1:n_leaf){
+    p_list[[ii]] = p_list[[ii]] + theme(legend.position="none") + 
+      ggtitle(paste("Leaf Node",ii,", N=",leaf_n[ii]))
+  }
+  p1 = p_list[[1]] + theme(legend.position="none") 
+  p2 = p_list[[2]] + theme(legend.position="none") 
+  p3 = p_list[[3]] + theme(legend.position="none")
+  # p4 = p_list[[4]] + theme(legend.position="none")
+  
+  # 4. Create a blank plot
+  blankPlot = ggplot()+geom_blank(aes(1,1)) + 
+    cowplot::theme_nothing()
+
+  # p = grid.arrange(p1,p3,legend,p2, legend, ncol=3,
+  #              widths=c(5, 5, 2),
+  #              top=textGrob("Different Leaf Node's Shape",
+  #              gp=gpar(fontsize=15,fontface="bold")))
+  p = grid.arrange(p1,p2,p3,legend,
+                   ncol=2,
+               widths=c(5, 5),
+               top=textGrob("Different Leaf Node's Shape",
+               gp=gpar(fontsize=15,fontface="bold")))
+  
+  p
+}
+
+# triangle
+p = plot4(p_list = p_list2)
+#plot_grid(p)
+```
+
+# Comparison Matrices
+
+https://nlp.stanford.edu/IR-book/html/htmledition/evaluation-of-clustering-1.html
+
+## YS Examine Performance
+Yao's confusion:
+which one is makes more sense?
+
+- use all Y and X and A (is that make sense??)
+- use Y and X
+- use
+
+Simulation code for comparing alternative clustering methods
+
+```{r}
+SimuData = df_obs %>% dplyr::select(Y1_obs, Y2_obs, 
+                                    # Treat_num, 
+                                    starts_with("X"))
+
+```
+
+
+**K-means clustering**
+```{r}
+# 3 clusters, use X and Y
+kmeans_result3 = kmeans(SimuData, centers = 3)  # Assuming 3 clusters
+table(kmeans_result3$cluster)
+
+df_kmeans = data.frame(Y1 = SimuData[,1], Y2 = SimuData[,2], 
+                        Cluster = as.factor(kmeans_result3$cluster))
+ggplot(df_kmeans, aes(x = Y1, y = Y2, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "K-Means Clustering (k = 3)")
+
+
+
+# 4 clusters, use X and Y
+kmeans_result4 = kmeans(SimuData, centers = 4)  # Assuming 3 clusters
+table(kmeans_result4$cluster)
+
+df_kmeans = data.frame(Y1 = SimuData[,1], Y2 = SimuData[,2], 
+                        Cluster = as.factor(kmeans_result4$cluster))
+ggplot(df_kmeans, aes(x = Y1, y = Y2, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "K-Means Clustering (k = 4)")
+
+df_obs$group.kmeans3 = kmeans_result3$cluster
+df_obs$group.kmeans4 = kmeans_result4$cluster
+```
+
+
+**Hierarchical Clustering**
+Two different algorithms are found in the literature for Ward clustering. 
+
+The one used by option "ward.D" (equivalent to the only Ward option "ward" in R versions ≤ 3.0.3) does not implement Ward's (1963) clustering criterion, whereas option "ward.D2" implements that criterion (Murtagh and Legendre 2014). With the latter, the dissimilarities are squared before cluster updating. Note that agnes(*, method="ward") corresponds to hclust(*, "ward.D2").
+
+```{r}
+hc_result = hclust(dist(SimuData), method = "ward.D2")
+plot(hc_result, labels = FALSE, main = "Dendrogram of Hierarchical Clustering")
+# assume 4 clusters
+hc_clusters = cutree(hc_result, k = 4)
+table(hc_clusters)
+
+df_hc = data.frame(SimuData, Cluster = as.factor(hc_clusters))
+ggplot(df_hc, aes(x = Y1_obs, y = Y2_obs, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Hierarchical Clustering")
+
+df_obs$group.hc = hc_clusters
+```
+
+
+
+**Gaussian Mixture Model (GMM)**
+Model-based clustering based on parameterized finite Gaussian mixture models. Models are estimated by EM algorithm initialized by hierarchical model-based agglomerative clustering. The optimal model is then selected according to BIC.
+```{r}
+gmm_result = Mclust(SimuData# , 
+                     #G = 5
+                     )  # Assuming 4 clusters
+table(gmm_result$classification)
+df_gmm = data.frame(SimuData, Cluster = as.factor(gmm_result$classification))
+
+
+summary(gmm_result, parameter = T)
+# gmm_result$z
+ggplot(df_gmm, aes(x = Y1_obs, y = Y2_obs, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Gaussian Mixture Model (GMM) Clustering")
+
+
+df_obs$group.gmm = gmm_result$classification 
+```
+
+
+**Spectral Clustering**
+A spectral clustering algorithm. Clustering is performed by embedding the data into the subspace of the eigenvectors of an affinity matrix.
+```{r}
+spectral_result = specc(as.matrix(SimuData), centers = 4)  # Assuming 4 clusters
+table(spectral_result)
+# spectral_result@.Data
+df_spectral = data.frame(SimuData, 
+                          Cluster = as.factor(spectral_result@.Data))
+ggplot(df_spectral, aes(x = Y1_obs, y = Y2_obs, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Spectral Clustering")
+
+
+df_obs$group.spectral = spectral_result@.Data
+```
+
+
+**Self-Organizing Map (SOM)**
+```{r}
+som_grid = somgrid(xdim = 2, ydim = 2, topo = "rectangular")
+som_model = som(as.matrix(SimuData), grid = som_grid, rlen = 100)
+som_clusters = cutree(hclust(dist(som_model$codes[[1]])), k = 4)  # Cluster SOM codes
+
+# Assign SOM clusters to data
+som_result = som_model$unit.classif
+table(som_clusters[som_result])
+
+# Visualize SOM Clustering
+df_som = data.frame(SimuData, 
+                     Cluster = as.factor(som_clusters[som_result]))
+ggplot(df_som, aes(x = Y1_obs, y = Y2_obs, color = Cluster)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Self-Organizing Map (SOM) Clustering")
+
+
+df_obs$group.som = som_clusters[som_result]
+```
+
+
+######. Examine Performance ######
+
+### Clustering purity measures
+
+**1. Normalized mutual information**
+Measures the mutual dependence between the true labels and the predicted clusters, normalized to be between 0 and 1.
+
+
+**2. Adjusted Rand index (ARI)**
+
+Rand index: Measures the proportion of true positive and true negative decisions in clustering (i.e., correctly grouped or separated pairs).
+
+ARI corrects the Rand Index for chance by adjusting the similarity score based on the expected similarity if clusters were assigned at random.
+ARI ranges from -1 to 1, where:
+
+* 1 indicates perfect agreement between the two cluster assignments.
+* 0 indicates random labeling.
+* Negative values suggest less agreement than expected by chance.
+
+```{r}
+true_labels_nmi = as.cl_partition(df_obs$Group)     
+true_labels_ari = as.numeric(df_obs$Group)      
+clustering_methods = list(
+  MOTree = df_obs$group.MOTree,
+  KMeans3 = df_obs$group.kmeans3,
+  KMeans4 = df_obs$group.kmeans4,
+  HC = df_obs$group.hc,
+  GMM = df_obs$group.gmm,
+  Spectral = df_obs$group.spectral,
+  SOM = df_obs$group.som
+)
+nmi_results = as.list(rep(NA,7))
+ari_results = as.list(rep(NA,7))
+names(nmi_results) = names(clustering_methods)
+names(ari_results) = names(clustering_methods)
+dist_matrix = dist(as.matrix(SimuData))# Note: cluster.stats needs a distance matrix - we use Euclidean distance on SimuData
+
+for (method in seq_along(clustering_methods)) {
+  method_name = names(clustering_methods)[i]
+  pred_labels_nmi = as.cl_partition(clustering_methods[[method_name]])  
+  pred_labels_ari = as.numeric(clustering_methods[[method_name]])      
+  
+  nmi_results[[method]] = as.numeric(cl_agreement(true_labels_nmi, 
+                                            pred_labels_nmi, 
+                                            method = "NMI"))
+  ari_results[[method]] = cluster.stats(dist_matrix, true_labels_ari, 
+                                  pred_labels_ari)$corrected.rand
+}
+nmi_results
+ari_results
+```
+
+
+### Counterfactual mean outcome
+
+```{r}
+cluster_opt_trt_MOTree = c()
+for (cluster in unique(df_obs$group.MOTree)) {
+  cluster_ids = which(df_obs$group.MOTree == cluster)
+  avg_outcomes = colMeans(Y1[cluster_ids, , drop = FALSE])
+  cluster_opt_trt_MOTree[cluster] = which.max(avg_outcomes)
+}
+
+df_obs$opt_trt_MOTree = sapply(df_obs$group.MOTree, 
+                                function(cluster) cluster_opt_trt_MOTree[cluster])
+
+df_obs$cf_MOTree = sapply(1:nrow(Y1), function(i) Y1[i, df_obs$opt_trt_MOTree[i]])
+
+avg_cf_MOTree = mean(df_obs$cf_MOTree)
+avg_cf_MOTree
+```
+
+```{r}
+# Define the weight sequence
+weights <- seq(0, 1, by = 0.1)
+
+# List of clustering methods to evaluate
+clustering_methods <- c("group.MOTree", "group.kmeans3", "group.kmeans4", "group.hc", "group.gmm", "group.spectral", "group.som")
+
+# Initialize list to store average counterfactual outcomes for each weight and method
+avg_cf_results <- list()
+
+# Loop over each weight combination to create Y_w matrices and calculate results
+for (w_idx in seq_along(weights)) {
+  # Current weight
+  w <- weights[w_idx]
+  
+  # Step 1: Generate the weighted counterfactual outcome matrix for the current weight
+  Y_w <- w * Y1 + (1 - w) * Y2
+  
+  # Initialize vector to store results for the current weight
+  avg_cf_results[[paste0("avg_cf_result", w_idx - 1)]] <- numeric(length(clustering_methods))
+  
+  # Step 2: Loop over each clustering method
+  for (method_idx in seq_along(clustering_methods)) {
+    # Get the method name and cluster labels
+    method_name <- clustering_methods[method_idx]
+    cluster_labels <- df_obs[[method_name]]
+    
+    # Step 3: Determine the optimal treatment for each cluster in the current method using Y_w
+    cluster_opt_trt <- sapply(unique(cluster_labels), function(cluster) {
+      cluster_ids <- which(cluster_labels == cluster)
+      avg_outcomes <- colMeans(Y_w[cluster_ids, , drop = FALSE])
+      which.max(avg_outcomes)  # Optimal treatment with max average outcome
+    })
+    
+    # Step 4: Assign the optimal treatment to each patient based on their cluster
+    df_obs[[paste0("opt_trt_", method_name, "_w", w_idx - 1)]] <- sapply(cluster_labels, function(cluster) cluster_opt_trt[as.character(cluster)])
+    
+    # Step 5: Calculate counterfactual outcome based on the assigned optimal treatment
+    df_obs[[paste0("cf_", method_name, "_w", w_idx - 1)]] <- sapply(1:nrow(Y_w), function(i) Y_w[i, df_obs[[paste0("opt_trt_", method_name, "_w", w_idx - 1)]][i]])
+    
+    # Step 6: Compute and store the average counterfactual mean outcome for the method and weight
+    avg_cf_results[[paste0("avg_cf_result", w_idx - 1)]][method_idx] <- mean(df_obs[[paste0("cf_", method_name, "_w", w_idx - 1)]])
+  }
+}
+
+# Naming each entry in avg_cf_results for clarity
+names(avg_cf_results) <- paste0("avg_cf_result", seq_along(weights) - 1)
+avg_cf_results
+```
+
+
+
+
+
+
+###### Archived ####
+
+## YS note: decide not to use this since it is a measure that evaluate the comopatness and separation of the clusteres based on daatr alone, but do not requires the true labels
+
+**Calinski-Harabasz Index (CH)**
+Measures the ratio of the sum of between-cluster dispersion to within-cluster dispersion. Higher values indicate better-defined clusters
+
+```{r}
+clustering_methods = list(
+  MOTree = as.numeric(df_obs$group.MOTree),
+  KMeans3 = as.numeric(df_obs$group.kmeans3),
+  KMeans4 = as.numeric(df_obs$group.kmeans4),
+  HC = as.numeric(df_obs$group.hc),
+  GMM = as.numeric(df_obs$group.gmm),
+  Spectral = as.numeric(df_obs$group.spectral),
+  SOM = as.numeric(df_obs$group.som)
+)
+
+# Initialize an empty list to store the CH Index results
+ch_index_results = list()
+
+# Loop through each clustering method and calculate the CH Index
+for (method_name in names(clustering_methods)) {
+  # Extract the predicted labels for the current method
+  pred_labels = clustering_methods[[method_name]]
+  
+  # Calculate the CH Index using cluster.stats
+  ch_index = cluster.stats(d = dist_matrix, clustering = pred_labels)$ch
+  
+  # Store the result in the list
+  ch_index_results[[method_name]] = ch_index
+}
+
+# Display the Calinski-Harabasz Index results
+ch_index_results
+
+
+
+```
+
+##### not used 
+
+```{r}
+# Prepare a vector to store performance metrics
+clustering_methods = c("group.kmeans3", 
+                        "group.kmeans4", 
+                        "group.hc", 
+                        "group.gmm", 
+                        "group.spectral", 
+                        "group.som")
+performance_metrics = data.frame(Method = clustering_methods, 
+                                  NMI = NA, 
+                                  RI = NA, 
+                                  ARI = NA, 
+                                  CH_Index = NA)
+
+true_labels = df_obs$Group
+
+for (i in seq_along(clustering_methods)) {
+  method = clustering_methods[i]
+  pred_labels = df_obs[[method]]  
+  
+  NMI = clue::NMI(as.numeric(true_labels), as.numeric(pred_labels))$value
+  RI = cluster.stats(d = dist(SimuData), as.numeric(true_labels), as.numeric(pred_labels))$corrected.rand
+  ARI = cluster.stats(d = dist(SimuData), as.numeric(true_labels), as.numeric(pred_labels))$adj.rand
+  
+  CHI = calinhara(SimuData, as.numeric(pred_labels), cn = max(pred_labels))
+  
+  # Store metrics in the data frame
+  performance_metrics$NMI[i] = NMI
+  performance_metrics$RI[i] = RI
+  performance_metrics$ARI[i] = ARI
+  performance_metrics$CH_Index[i] = CHI
+}
+
+# Display the performance metrics table
+performance_metrics
+```
+
+
+
+# CW original code
+
+Generate Data
+```{r}
+set.seed(123)
+k = 4
+n = 100
+
+group = rep(1:4,each = n)
+x = rnorm(n*4,0,0.05) + (group-1)/3
+x = round(x,3)
+plot(density(x,from  =-0.2,to = 1.2))
+
+
+# group 1: A: (1,0) B: (0,1) C:(-1,0) D:(0,-1)
+# group 2: A: (1,0) B: (0,1) C:(0,-1) D:(-1,0)
+# group 3: B: (1,0) C: (0,1) D:(-1,0) A:(0,-1)
+# group 4: C: (1,0) D: (0,1) A:(-1,0) B:(0,-1)
+
+m1 = c(1,0,0,1,
+              -1,0,
+              0,-1)
+
+m2 = c(1,0,0,1,
+              0,-1,
+              -1,0)
+
+m3 = c(0,-1,1,0,0,1,-1,0)
+
+m4 = c(-1,0,0,-1,
+              1,0,
+              0,1)
+
+list_m = list(m1 = m1,m2 = m2,m3 = m3,m4 = m4)
+Y = matrix(0,n*4,2*4)
+
+for(ii in 1:(4*n)){
+  ind = group[ii]
+  Y[ii,] = list_m[[ind]] + rnorm(8,0,0.2)
+}
+
+Y1 = Y[,c(1,3,5,7)]
+Y2 = Y[,c(2,4,6,8)]
+
+df_vis = data.frame(y1 = as.vector(Y1),
+                    y2 = as.vector(Y2),
+                    Treat = rep(c("A","B","C","D"),each = length(Y1)/4),
+                    group = rep(group,4))
+df_vis$Treat = as.factor(df_vis$Treat)
+
+ggplot(data = df_vis,aes(x = y1,y = y2,col = Treat))+
+  geom_point()+
+  facet_wrap(~group)+
+  ylab("Outcome 2")+
+  xlab("Outcome 1")
+```
+
+```{r}
+w0 = seq(0,1,0.05)
+A = sample(c("A","B","C","D"),4*n,replace = TRUE,prob=c(1/4,1/4,1/4,1/4)) 
+class.A = sort(unique(A))
+H = matrix(x,ncol=1)
+n = length(A)
+
+
+k=K=length(class.A)
+m=N=length(A)
+
+label0 = paste(c("A","B","C","D"),":",class.A,sep="")
+
+mu1.hat = Y1
+mu2.hat = Y2
+
+treeout = DTRtree(mus.hat = list(Y1,Y2),
+        A,H,
+        pis.hat=NULL,
+        mus.reg=NULL,
+        depth=3,
+        minsplit=10,w_vec = cbind(w0,1-w0),weight_combine = "mean",lambda = 0.02)
+
+treeout
+newdata = H
+(leaf_pred = predict_leaf.DTR(treeout, H))
+# table(leaf_pred)
+leaf_n = table(leaf_pred)
+
+tree0 = vis_tree(max_h = 3,treeout,number = table(leaf_pred))
+plot(tree0)
+```
+
+Point Visualization
+```{R}
+p_list2 = list()
+p_list3 = list()
+leaf_vec = sort(unique(leaf_pred))
+n_leaf = length(leaf_vec)
+
+
+
+for(ii in 1:n_leaf){
+  chosen = which(leaf_pred==leaf_vec[ii])
+  (p_list2[[ii]] = my_vis_elipse(mu1.hat,mu2.hat,chosen,
+                                 k=4,ref_k = 1, label=label0,lwd=3))
+}
+
+
+# + xlim(-0.3,0.25) + ylim(-0.2,0.3)
+
+plot4 = function(p_list){
+  # 2. Save the legend
+  legend = get_legend(p_list[[1]])
+  
+  # 3. Remove the legend from the box plot
+  for(ii in 1:n_leaf){
+    p_list[[ii]] = p_list[[ii]] + theme(legend.position="none") + 
+      ggtitle(paste("Leaf Node",ii,", N=",leaf_n[ii]))
+  }
+  p1 = p_list[[1]] + theme(legend.position="none") 
+  p2 = p_list[[2]] + theme(legend.position="none") 
+  p3 = p_list[[3]] + theme(legend.position="none")
+  # p4 = p_list[[4]] + theme(legend.position="none")
+  
+  # 4. Create a blank plot
+  blankPlot = ggplot()+geom_blank(aes(1,1)) + 
+    cowplot::theme_nothing()
+  # pdf(file = "~/Desktop/Multi_Outcome/cluster/LZ_compare/LZ_assumption.pdf",
+  #     width = 17.4 / 2.54*1.5, # The width of the plot in inches
+  #     height = 17.4 / 2.54 * 0.75) # The height of the plot in inches
+  p = grid.arrange(p1,p3,
+               legend,p2, legend, ncol=3,
+               widths=c(5, 5, 2),
+               top=textGrob("Different Leaf Node's Shape",
+                            gp=gpar(fontsize=18,fontface="bold")))
+  p
+}
+
+# triangle
+p = plot4(p_list = p_list2)
+#plot_grid(p)
+```
+
+
